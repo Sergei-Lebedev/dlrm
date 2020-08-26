@@ -17,6 +17,7 @@ my_local_size = -1
 alltoall_supported = False
 a2a_impl = os.environ.get('DLRM_ALLTOALL_IMPL', '')
 
+pg_a2a = None
 myreq = None
 
 def env2int(env_list, default = -1):
@@ -41,6 +42,7 @@ def get_split_lengths(n):
 
 def init_distributed(rank = -1, size = -1, use_gpu = False, backend=''):
     global myreq
+    global pg_a2a
     global my_rank
     global my_size
     global my_local_rank
@@ -50,6 +52,7 @@ def init_distributed(rank = -1, size = -1, use_gpu = False, backend=''):
 
     # guess MPI ranks from env (works for IMPI, OMPI and MVAPICH2)
     num_mpi_ranks = env2int(['PMI_SIZE', 'OMPI_COMM_WORLD_SIZE', 'MV2_COMM_WORLD_SIZE', 'WORLD_SIZE'])
+    use_ucx_a2a = env2int(['DLRM_USE_UCX_A2A'])
     if backend == '' and num_mpi_ranks > 1:
         if torch_ccl and env2int(['CCL_WORKER_COUNT']) > 0:
             backend = 'ccl'
@@ -78,8 +81,8 @@ def init_distributed(rank = -1, size = -1, use_gpu = False, backend=''):
             os.environ['MASTER_ADDR'] = '127.0.0.1'
 
     if size > 1:
-        my_local_rank = env2int(['MPI_LOCALRANKID', 'OMPI_COMM_WORLD_LOCAL_RANK', 'MV2_COMM_WORLD_LOCAL_RANK'], 0)
-        my_local_size = env2int(['MPI_LOCALNRANKS', 'OMPI_COMM_WORLD_LOCAL_SIZE', 'MV2_COMM_WORLD_LOCAL_SIZE'], 1)
+        my_local_rank = env2int(['MPI_LOCALRANKID', 'OMPI_COMM_WORLD_LOCAL_RANK', 'MV2_COMM_WORLD_LOCAL_RANK', 'LOCAL_RANK'], 0)
+        my_local_size = env2int(['MPI_LOCALNRANKS', 'OMPI_COMM_WORLD_LOCAL_SIZE', 'MV2_COMM_WORLD_LOCAL_SIZE', 'LOCAL_SIZE'], 1)
         if use_gpu:
             if my_local_size > torch.cuda.device_count():
                 print("Not sufficient GPUs available... local_size = %d, ngpus = %d" % (ext_dist.my_local_size, ngpus))
@@ -89,12 +92,31 @@ def init_distributed(rank = -1, size = -1, use_gpu = False, backend=''):
         my_rank = dist.get_rank()
         my_size = dist.get_world_size()
         if my_rank == 0: print("Running on %d ranks using %s backend" % (my_size, backend))
+        if use_ucx_a2a > 0:
+            try:
+                addr = os.environ["MASTER_ADDR"]
+                port = int(os.environ["MASTER_PORT"])
+                if my_rank == 0:
+                    store = dist.TCPStore(addr, port + 1, my_size, True)
+                else:
+                    store = dist.TCPStore(addr, port + 1, my_size, False)
+                pg_a2a = dist.ProcessGroupUCX(dist.PrefixStore("dlrm_ucx", store),
+                                              rank=rank,
+                                              size=size,
+                                              timeout=10.0)
+            except RuntimeError:
+                printf("Failed to init UCX PG")
         if hasattr(dist, 'all_to_all_single'):
             try:
                 t = torch.zeros([4])
                 if use_gpu:
                     t = t.cuda()
-                dist.all_to_all_single(t, t)
+                if pg_a2a is None:
+                    dist.all_to_all_single(t, t)
+                    if my_rank == 0: print("Using %s for alltoall" % (backend))
+                else:
+                    dist.all_to_all_single(t, t, group=pg_a2a)
+                    if my_rank == 0: print("Using UCX for alltoall")
                 alltoall_supported = True
             except RuntimeError:
                 pass
@@ -260,6 +282,7 @@ class All2All_Req(Function):
     @staticmethod
     def forward(ctx, a2ai, *inputs):
         global myreq
+        global pg_a2a
         #print("All2All_Req:forward")
         mb_split_lengths = a2ai.gNS
         if mb_split_lengths: mb_split_lengths = [m * a2ai.E for m in mb_split_lengths]
@@ -267,7 +290,10 @@ class All2All_Req(Function):
         if emb_split_lengths: emb_split_lengths = [a2ai.lN * e * a2ai.E for e in emb_split_lengths]
         input = torch.cat(inputs, dim=1).view([-1])
         output = input.new_empty([a2ai.S*a2ai.lN*a2ai.E])
-        req = dist.all_to_all_single(output, input, emb_split_lengths, mb_split_lengths, async_op=True)
+        if pg_a2a is None:
+           req = dist.all_to_all_single(output, input, emb_split_lengths, mb_split_lengths, async_op=True)
+        else:
+           req = dist.all_to_all_single(output, input, emb_split_lengths, mb_split_lengths, async_op=True, group=pg_a2a)
 
         myreq.req = req
         myreq.tensor = []
@@ -311,12 +337,16 @@ class All2All_Wait(Function):
     @staticmethod
     def backward(ctx, *grad_outputs):
         global myreq
+        global pg_a2a
         #print("All2All_Wait:backward")
         a2ai = ctx.a2ai
         grad_outputs = [gout.contiguous().view([-1]) for gout in grad_outputs]
         grad_output = torch.cat(grad_outputs)
         grad_input = grad_output.new_empty([a2ai.N * a2ai.lS * a2ai.E])
-        req = dist.all_to_all_single(grad_input, grad_output, a2ai.mb_split_lengths, a2ai.emb_split_lengths, async_op=True)
+        if pg_a2a is None:
+            req = dist.all_to_all_single(grad_input, grad_output, a2ai.mb_split_lengths, a2ai.emb_split_lengths, async_op=True)
+        else:
+            req = dist.all_to_all_single(grad_input, grad_output, a2ai.mb_split_lengths, a2ai.emb_split_lengths, async_op=True, group=pg_a2a)
         myreq.req = req
         myreq.tensor = grad_input
         return (grad_output,)
