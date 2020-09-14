@@ -100,16 +100,7 @@ def init_distributed(rank = -1, size = -1, use_gpu = False, backend=''):
         if my_rank == 0: print("Running on %d ranks using %s backend" % (my_size, backend))
         if use_ucx_a2a > 0:
             try:
-                addr = os.environ["MASTER_ADDR"]
-                port = int(os.environ["MASTER_PORT"])
-                if my_rank == 0:
-                    store = dist.TCPStore(addr, port + 1, my_size, True)
-                else:
-                    store = dist.TCPStore(addr, port + 1, my_size, False)
-                pg_a2a = dist.ProcessGroupUCX(dist.PrefixStore("dlrm_ucx", store),
-                                              rank=rank,
-                                              size=size,
-                                              timeout=10.0)
+                pg_a2a = dist.new_group(backend="ucc")
             except RuntimeError:
                 printf("Failed to init UCX PG")
         if hasattr(dist, 'all_to_all_single'):
